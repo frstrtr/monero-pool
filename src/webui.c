@@ -160,19 +160,6 @@ int
 start_web_ui(wui_context_t *context)
 {
     log_debug("Starting Web UI");
-<<<<<<< HEAD
-    int use_epoll = MHD_is_feature_supported(MHD_FEATURE_EPOLL) == MHD_YES;
-    log_debug("MHD will use epoll: %u", use_epoll);
-
-    unsigned flags = MHD_USE_SELECT_INTERNALLY;
-    if (use_epoll)
-        flags = MHD_USE_EPOLL_INTERNALLY_LINUX_ONLY;
-
-    mhd_daemon = MHD_start_daemon(flags,
-            context->port, NULL, NULL,
-            &answer_to_connection, (void*) context, MHD_OPTION_END);
-    return mhd_daemon != NULL ? 0 : -1;
-=======
     if (webui_base || handle)
     {
         log_error("Already running");
@@ -194,7 +181,6 @@ start_web_ui(wui_context_t *context)
     if (!rc)
         pthread_detach(handle);
     return rc;
->>>>>>> 834bef7008a55a187a4854175092107c1a75a82e
 }
 
 void
