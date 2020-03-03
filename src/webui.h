@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2014-2019, The Monero Project
+Copyright (c) 2014-2020, The Monero Project
 
 All rights reserved.
 
@@ -42,6 +42,7 @@ typedef struct pool_stats_t
     uint64_t network_height;
     uint32_t connected_miners;
     uint64_t pool_hashrate;
+    uint64_t round_hashes;
     uint32_t pool_blocks_found;
     time_t last_block_found;
     time_t last_template_fetched;
@@ -54,6 +55,7 @@ typedef struct wui_context_t
     double pool_fee;
     double payment_threshold;
     uint32_t pool_port;
+    uint32_t pool_ssl_port;
     unsigned allow_self_select;
 } wui_context_t;
 

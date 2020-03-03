@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2014-2019, The Monero Project
+Copyright (c) 2014-2020, The Monero Project
 
 All rights reserved.
 
@@ -40,6 +40,7 @@ developers.
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 #include <event2/http.h>
+#include <event2/thread.h>
 
 #include <lmdb.h>
 
@@ -133,9 +134,11 @@ typedef struct config_t
     uint64_t pool_start_diff;
     double share_mul;
     uint32_t retarget_time;
+    double retarget_ratio;
     double pool_fee;
     double payment_threshold;
     uint32_t pool_port;
+    uint32_t pool_ssl_port;
     uint32_t log_level;
     uint32_t webui_port;
     char log_file[MAX_PATH];
@@ -251,6 +254,7 @@ static pthread_mutex_t mutex_clients = PTHREAD_MUTEX_INITIALIZER;
 static FILE *fd_log;
 static unsigned char sec_view[32];
 static unsigned char pub_spend[32];
+static uint8_t nettype;
 
 #ifdef HAVE_RX
 extern void rx_stop_mining();
@@ -839,8 +843,8 @@ template_recycle(void *item)
     }
 }
 
-static void
-retarget(client_t *client, job_t *job)
+static uint64_t
+client_target(client_t *client, job_t *job)
 {
     uint64_t bd = 0xFFFFFFFFFFFFFFFF;
     if (job->block_template)
@@ -849,6 +853,20 @@ retarget(client_t *client, job_t *job)
     uint8_t retarget_time = client->is_xnp ? 5 : config.retarget_time;
     uint64_t target = fmin(fmax((double)client->hashes /
             duration * retarget_time, config.pool_start_diff), bd);
+    return target;
+}
+
+static bool
+retarget_required(client_t *client, job_t *job)
+{
+    return ((double)job->target / client_target(client, job)
+            < config.retarget_ratio);
+}
+
+static void
+retarget(client_t *client, job_t *job)
+{
+    uint64_t target = client_target(client, job);
     job->target = target;
     log_debug("Client %.32s target now %"PRIu64, client->client_id, target);
 }
@@ -1535,7 +1553,54 @@ rpc_on_block_template(const char* data, rpc_callback_t *callback)
 }
 
 static int
-startup_pauout(uint64_t height)
+startup_scan_round_shares()
+{
+    int rc;
+    char *err;
+    MDB_txn *txn;
+    MDB_cursor *cursor;
+
+    if ((rc = mdb_txn_begin(env, NULL, MDB_RDONLY, &txn)) != 0)
+    {
+        err = mdb_strerror(rc);
+        log_error("%s", err);
+        return rc;
+    }
+    if ((rc = mdb_cursor_open(txn, db_shares, &cursor)) != 0)
+    {
+        err = mdb_strerror(rc);
+        log_error("%s", err);
+        mdb_txn_abort(txn);
+        return rc;
+    }
+    MDB_cursor_op op = MDB_LAST;
+    while (1)
+    {
+        MDB_val key;
+        MDB_val val;
+        rc = mdb_cursor_get(cursor, &key, &val, op);
+        if (rc != 0 && rc != MDB_NOTFOUND)
+        {
+            err = mdb_strerror(rc);
+            log_error("%s", err);
+            break;
+        }
+        if (rc == MDB_NOTFOUND)
+            break;
+        op = MDB_PREV;
+        share_t *share = (share_t*)val.mv_data;
+        if (share->timestamp > pool_stats.last_block_found)
+            pool_stats.round_hashes += share->difficulty;
+        else
+            break;
+    }
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+    return 0;
+}
+
+static int
+startup_payout(uint64_t height)
 {
     /*
       Loop stored blocks < height - 60
@@ -1620,9 +1685,6 @@ rpc_on_view_key(const char* data, rpc_callback_t *callback)
     const char *vk = json_object_get_string(key);
     hex_to_bin(vk, strlen(vk), &sec_view[0], 32);
     json_object_put(root);
-
-    uint64_t prefix;
-    parse_address(config.pool_wallet, &prefix, &pub_spend[0]);
 }
 
 static void
@@ -1667,7 +1729,8 @@ rpc_on_last_block_header(const char* data, rpc_callback_t *callback)
     {
         block_t *block = bstack_push(bsh, NULL);
         response_to_block(block_header, block);
-        startup_pauout(block->height);
+        startup_payout(block->height);
+        startup_scan_round_shares();
         need_new_template = true;
     }
 
@@ -1728,6 +1791,7 @@ rpc_on_block_submitted(const char* data, rpc_callback_t *callback)
     pool_stats.pool_blocks_found++;
     block_t *b = (block_t*)callback->data;
     pool_stats.last_block_found = b->timestamp;
+    pool_stats.round_hashes = 0;
     log_info("Block submitted at height: %"PRIu64, b->height);
     int rc = store_block(b->height, b);
     if (rc != 0)
@@ -2085,12 +2149,17 @@ client_on_login(json_object *message, client_t *client)
     }
 
     const char *address = json_object_get_string(login);
-    uint64_t prefix;
-    parse_address(address, &prefix, NULL);
-    if (prefix != MAINNET_ADDRESS_PREFIX && prefix != TESTNET_ADDRESS_PREFIX)
+    uint8_t nt;
+    if (parse_address(address, NULL, &nt, NULL))
     {
         send_validation_error(client,
-                "login only main wallet addresses are supported");
+                "Invalid address");
+        return;
+    }
+    if (nt != nettype)
+    {
+        send_validation_error(client,
+                "Invalid address network type");
         return;
     }
 
@@ -2468,6 +2537,7 @@ client_on_submit(json_object *message, client_t *client)
         share.difficulty = job->target;
         strncpy(share.address, client->address, sizeof(share.address));
         share.timestamp = now;
+        pool_stats.round_hashes += share.difficulty;
         log_debug("Storing share with difficulty: %"PRIu64, share.difficulty);
         int rc = store_share(share.height, &share);
         if (rc != 0)
@@ -2475,6 +2545,12 @@ client_on_submit(json_object *message, client_t *client)
         char body[STATUS_BODY_MAX];
         stratum_get_status_body(body, client->json_id, "OK");
         evbuffer_add(output, body, strlen(body));
+    }
+    if (retarget_required(client, job))
+    {
+        log_debug("Sending an early job as this was less than %u%% of"
+                " potential", (unsigned)(100.*config.retarget_ratio));
+        client_send_job(client, false);
     }
 }
 
@@ -2504,17 +2580,6 @@ client_on_read(struct bufferevent *bev, void *ctx)
         stratum_get_error_body(body, client->json_id, too_long);
         evbuffer_add(output, body, strlen(body));
         log_info(too_long);
-        evbuffer_drain(input, len);
-        client_clear(bev);
-        return;
-    }
-
-    if (client->bad_shares > MAX_BAD_SHARES)
-    {
-        char body[ERROR_BODY_MAX];
-        stratum_get_error_body(body, client->json_id, too_bad);
-        evbuffer_add(output, body, strlen(body));
-        log_info(too_bad);
         evbuffer_drain(input, len);
         client_clear(bev);
         return;
@@ -2585,6 +2650,16 @@ client_on_read(struct bufferevent *bev, void *ctx)
             client_clear(bev);
             return;
         }
+        if (client->bad_shares > MAX_BAD_SHARES)
+        {
+            char body[ERROR_BODY_MAX];
+            stratum_get_error_body(body, client->json_id, too_bad);
+            evbuffer_add(output, body, strlen(body));
+            log_info(too_bad);
+            evbuffer_drain(input, len);
+            client_clear(bev);
+            return;
+        }
     }
 }
 
@@ -2640,9 +2715,11 @@ read_config(const char *config_file)
     config.pool_start_diff = 100;
     config.share_mul = 2.0;
     config.retarget_time = 120;
+    config.retarget_ratio = 0.55;
     config.pool_fee = 0.01;
     config.payment_threshold = 0.33;
     config.pool_port = 4242;
+    config.pool_ssl_port = 0;
     config.log_level = 5;
     config.webui_port = 4243;
     config.block_notified = false;
@@ -2699,6 +2776,10 @@ read_config(const char *config_file)
         {
             config.pool_port = atoi(val);
         }
+        else if (strcmp(key, "pool-ssl-port") == 0)
+        {
+            config.pool_ssl_port = atoi(val);
+        }
         else if (strcmp(key, "webui-port") == 0)
         {
             config.webui_port = atoi(val);
@@ -2747,6 +2828,10 @@ read_config(const char *config_file)
         {
             config.retarget_time = atoi(val);
         }
+        else if (strcmp(key, "retarget-ratio") == 0)
+        {
+            config.retarget_ratio = atof(val);
+        }
         else if (strcmp(key, "log-level") == 0)
         {
             config.log_level = atoi(val);
@@ -2783,10 +2868,22 @@ read_config(const char *config_file)
         log_fatal("No pool wallet supplied. Aborting.");
         exit(-1);
     }
+    if (parse_address(config.pool_wallet, NULL, &nettype, &pub_spend[0]))
+    {
+        log_fatal("Invalid pool wallet");
+        exit(-1);
+    }
     if (!config.wallet_rpc_host[0] || config.wallet_rpc_port == 0)
     {
         log_fatal("Both wallet-rpc-host and wallet-rpc-port need setting. "
                 "Aborting.");
+        exit(-1);
+    }
+    if (config.retarget_ratio < 0 || config.retarget_ratio > 1)
+    {
+        log_fatal("Set retarget-ratio to any rational value within range "
+                "[0, 1]. Clients will receive new jobs earlier if their latest"
+                " work is less than retarget-ratio percentage of potential.");
         exit(-1);
     }
 
@@ -2795,7 +2892,8 @@ static void print_config()
 {
     log_info("\nCONFIG:\n"
         "  pool-port = %u\n"
-        "  webui-port=%u\n"
+        "  pool-ssl-port = %u\n"
+        "  webui-port= %u\n"
         "  rpc-host = %s\n"
         "  rpc-port = %u\n"
         "  wallet-rpc-host = %s\n"
@@ -2807,6 +2905,7 @@ static void print_config()
         "  payment-threshold = %.2f\n"
         "  share-mul = %.2f\n"
         "  retarget-time = %u\n"
+        "  retarget-ratio = %.2f\n"
         "  log-level = %u\n"
         "  log-file = %s\n"
         "  block-notified = %u\n"
@@ -2815,6 +2914,7 @@ static void print_config()
         "  pid-file = %s\n"
         "  forked = %u\n",
         config.pool_port,
+        config.pool_ssl_port,
         config.webui_port,
         config.rpc_host,
         config.rpc_port,
@@ -2827,6 +2927,7 @@ static void print_config()
         config.payment_threshold,
         config.share_mul,
         config.retarget_time,
+        config.retarget_ratio,
         config.log_level,
         config.log_file,
         config.block_notified,
@@ -2921,7 +3022,8 @@ cleanup(void)
     log_info("Performing cleanup");
     if (listener_event)
         event_free(listener_event);
-    stop_web_ui();
+    if (config.webui_port)
+        stop_web_ui();
     if (signal_usr1)
         event_free(signal_usr1);
     if (timer_120s)
@@ -2946,8 +3048,22 @@ cleanup(void)
         fclose(fd_log);
 }
 
+static void
+print_help(struct option *opts)
+{
+    for (; opts->name; ++opts)
+    {
+        printf("-%c, --%s %s\n", opts->val, opts->name,
+            opts->has_arg==required_argument ?
+            strstr(opts->name,"file") ? "<file>" : "<dir>" :
+            opts->has_arg==optional_argument ? "[0|1]" : "" );
+    }
+}
+
 int main(int argc, char **argv)
 {
+    int evthread_use_pthreads(void);
+
     static struct option options[] =
     {
         {"config-file", required_argument, 0, 'c'},
@@ -2956,19 +3072,20 @@ int main(int argc, char **argv)
         {"data-dir", required_argument, 0, 'd'},
         {"pid-file", required_argument, 0, 'p'},
         {"forked", optional_argument, 0, 'f'},
+        {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
     char *config_file = NULL;
     char *log_file = NULL;
-    bool block_notified = false;
+    int block_notified = -1;
     char *data_dir = NULL;
     char *pid_file = NULL;
-    bool forked = false;
+    int forked = -1;
     int c;
     while (1)
     {
         int option_index = 0;
-        c = getopt_long (argc, argv, "c:l:b::d:p:f::",
+        c = getopt_long (argc, argv, "c:l:b::d:p:f::h",
                        options, &option_index);
         if (c == -1)
             break;
@@ -2981,9 +3098,13 @@ int main(int argc, char **argv)
                 log_file = strdup(optarg);
                 break;
             case 'b':
-                block_notified = true;
-                if (optarg)
-                    block_notified = atoi(optarg);
+                if (!optarg && argv[optind] && argv[optind][0] != '-')
+                {
+                    block_notified = atoi(argv[optind]);
+                    ++optind;
+                }
+                else
+                    block_notified = optarg ? atoi(optarg) : 1;
                 break;
             case 'd':
                 data_dir = strdup(optarg);
@@ -2992,9 +3113,18 @@ int main(int argc, char **argv)
                 pid_file = strdup(optarg);
                 break;
             case 'f':
-                forked = true;
-                if (optarg)
-                    forked = atoi(optarg);
+                if (!optarg && argv[optind] && argv[optind][0] != '-')
+                {
+                    forked = atoi(argv[optind]);
+                    ++optind;
+                }
+                else
+                    forked = optarg ? atoi(optarg) : 1;
+                break;
+            case 'h':
+            default:
+                print_help(options);
+                exit(-1);
                 break;
         }
     }
@@ -3021,9 +3151,9 @@ int main(int argc, char **argv)
         strncpy(config.pid_file, pid_file, sizeof(config.pid_file));
         free(pid_file);
     }
-    if (forked)
+    if (forked > -1)
         config.forked = forked;
-    if (block_notified)
+    if (block_notified > -1)
         config.block_notified = block_notified;
 
     log_set_level(LOG_FATAL - config.log_level);
@@ -3049,6 +3179,7 @@ int main(int argc, char **argv)
     }
 
     signal(SIGINT, sigint_handler);
+    signal(SIGPIPE, SIG_IGN);
     atexit(cleanup);
 
     int err = 0;
@@ -3078,9 +3209,11 @@ int main(int argc, char **argv)
     uic.pool_stats = &pool_stats;
     uic.pool_fee = config.pool_fee;
     uic.pool_port = config.pool_port;
+    uic.pool_ssl_port = config.pool_ssl_port;
     uic.allow_self_select = !config.disable_self_select;
     uic.payment_threshold = config.payment_threshold;
-    start_web_ui(&uic);
+    if (config.webui_port)
+        start_web_ui(&uic);
 
     run();
 
